@@ -16,6 +16,7 @@ Requirements:
     pip install google-genai pyautogui mss sounddevice soundfile keyboard numpy
     export GEMINI_API_KEY="your-key"
     -> A GEMINI API KEY IS NEEDED, it can be obtained in Google AI Studio
+    -> It must be declared as an environment variable GEMINI_API_KEY = "Your-Key"
 
 ATTENTION: this program controls your mouse cursor and keyboard.
 
