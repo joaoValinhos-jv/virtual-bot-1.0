@@ -35,6 +35,7 @@ import keyboard as kb  # used for global hotkeys
 import numpy as np
 import re
 import json
+import sys
 
 import pyautogui as pg  # moves the mouse / presses keys
 from mss import MSS  # very fast cross-platform screenshots
@@ -43,6 +44,8 @@ import sounddevice as sd  # microphone capture
 import soundfile as sf  # encodes raw audio into WAV
 from google import genai
 from google.genai import types
+from dotenv import load_dotenv
+from numpy.ma.core import true_divide
 
 # ---------------------------------------------------------------------------
 # Configuration ("MACROs")
@@ -52,11 +55,27 @@ from google.genai import types
 CHAT_MODEL = "gemini-3.5-flash-lite"
 STT_MODEL = "gemini-3.5-flash-lite"
 
+# For building an executable that can use a separate GEMINI_API_KEY variable
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+dotenv_path = os.path.join(BASE_DIR, ".env")
+load_dotenv(dotenv_path)
+
+if "GEMINI_API_KEY" not in os.environ:
+    print("ERROR: GEMINI_API_KEY wasn't found!")
+    input("\nPress 'enter' for closing...")
+    sys.exit(1)
+
 # Forces Gemini to answer with valid JSON, so we can json.loads() the reply
 # without begging the model nicely in the prompt.
 JSON_CONFIG = types.GenerateContentConfig(response_mime_type="application/json")
 
 SAMPLE_RATE = 16000  # 16 kHz is a nice frequency for speech recognition
+MAX_RETRIES = 2
+
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 # By default, slamming the mouse into a screen corner aborts PyAutoGUI.
@@ -102,6 +121,12 @@ DETECT_ACTION_INSTRUCTION = (
     "2. IF 'action' is 'new_tab' OR 'close', YOU MUST SET 'mouse_click' TO false AND 'keyboard_typing' TO false.\n"
     "3. Set 'double_click' to true if the step implies opening a desktop application, file, or shortcut by double-clicking.\n"
     "4. Set 'mouse_click' to true ONLY when clicking on a regular element."
+)
+
+REVIEW_INSTRUCTION = (
+    "\n\nYou are given two screenshots: BEFORE and AFTER the step above was executed. "
+    "Decide whether the step was successfully completed, judging by what is visible in the AFTER screenshot. "
+    'Answer only with JSON in the shape {"success": true, "reason": "short explanation"}.'
 )
 
 
@@ -250,7 +275,8 @@ class VirtualBOT:
         This will be the image that represents this exact moment."""
         with MSS() as sct:
             shot = sct.grab(sct.monitors[1])  # monitors[0] = all screens, [1] = primary (just for cases with more screens)
-            return mss.tools.to_png(shot.rgb, shot.size)
+            png_shot = mss.tools.to_png(shot.rgb, shot.size)
+            return png_shot
 
     @staticmethod
     def parse_point(text):
@@ -328,11 +354,57 @@ class VirtualBOT:
             pg.mouseUp(self.px, self.py, button='left')
             print(f"[VirtualBOT] Single clicked safely at ({self.px}, {self.py})")
 
+    async def review(self, step, before_png, after_png):
+        """Returns True only if Gemini confirms the step was completed."""
+        try:
+            resp = await client.aio.models.generate_content(
+                model=CHAT_MODEL,
+                contents=[
+                    f"Step: '{step}'" + REVIEW_INSTRUCTION,
+                    "BEFORE:",
+                    types.Part.from_bytes(data=before_png, mime_type="image/png"),
+                    "AFTER:",
+                    types.Part.from_bytes(data=after_png, mime_type="image/png"),
+                ],
+                config=JSON_CONFIG,
+            )
+            text = re.sub(r"^```(?:json)?|```$", "", (resp.text or "").strip(), flags=re.M).strip()
+            data = json.loads(text)
+            if isinstance(data, list):
+                data = data[0]
+            ok = data.get("success") is True
+            print(f"[Review] success={ok} | {data.get('reason', '')}")
+            return ok
+        except Exception as e:
+            # If the review itself fails, be conservative: treat as NOT done.
+            print(f"[Review] Could not verify step: {e}")
+            return False
+
 
 # Instantiating the objects
 agt = Agent()
 ppt = Prompt(agt)
 vbot = VirtualBOT()
+
+
+async def execute_step(step, image_bytes):
+    fst_response = await ppt.interact(step + COORD_INSTRUCTION, image_bytes, config=JSON_CONFIG)
+    x, y, label = vbot.parse_point(fst_response.text)
+
+    scd_response = await ppt.interact(step + DETECT_ACTION_INSTRUCTION, image_bytes, config=JSON_CONFIG)
+    data = json.loads(scd_response.text)
+
+    mouse_click = data.get("mouse_click", False)
+    action = data.get("action", "none")
+    keyboard_typing = data.get("keyboard_typing", False)
+    text_to_write = data.get("text_to_write")
+    double_click = data.get("double_click", False)
+
+    if action in ["new_tab", "close"]:
+        vbot.click(action=action)
+    elif mouse_click or keyboard_typing or text_to_write:
+        vbot.click(x_norm=x, y_norm=y, text_to_write=text_to_write,
+                   double_click=double_click, action="none")
 
 
 async def main():
@@ -399,7 +471,7 @@ async def main():
 
             print(f"[VirtualBOT] Planned steps: {commands_list}")
 
-            # See -> Think -> Act, step by step
+            # See -> Think -> Act -> Review, step by step
             for step_item in commands_list:
                 if isinstance(step_item, dict):
                     step = step_item.get("command") or step_item.get("step") or str(step_item)
@@ -408,44 +480,21 @@ async def main():
 
                 print(f"\n--- Executing step: '{step}' ---")
 
-                # New screenshot every step, the previous action changed the screen.
-                image_bytes = vbot.prt()
+                step_done = False
+                for attempt in range(1, MAX_RETRIES + 1):
+                    before = vbot.prt()
+                    await execute_step(step, before)
+                    await asyncio.sleep(1.0)
+                    after = vbot.prt()
 
-                # Locating the target
-                fst_response = await ppt.interact(
-                    step + COORD_INSTRUCTION, image_bytes, config=JSON_CONFIG
-                )
-                x, y, label = vbot.parse_point(fst_response.text)
+                    if await vbot.review(step, before, after):
+                        step_done = True
+                        breake
+                    print(f"[VirtualBOT] Step not confirmed (attempt {attempt}/{MAX_RETRIES}).")
 
-                # Linking it to the command, figuring out how to use it
-                scd_response = await ppt.interact(
-                    step + DETECT_ACTION_INSTRUCTION, image_bytes, config=JSON_CONFIG
-                )
-                data = json.loads(scd_response.text)
-
-                mouse_click = data.get("mouse_click", False)
-                action = data.get("action", "none")
-                keyboard_typing = data.get("keyboard_typing", False)
-                text_to_write = data.get("text_to_write")
-                double_click = data.get("double_click", False)
-
-                if action in ["new_tab", "close"]:
-                    # Lands at (0, 0), the top-left corner. Pass x_norm/y_norm
-                    # if you want to focus a specific window first.
-                    vbot.click(action=action)
-                    print(f"[VirtualBOT] Executed action: {action}")
-                elif mouse_click or keyboard_typing or text_to_write:
-                    vbot.click(
-                        x_norm=x,
-                        y_norm=y,
-                        text_to_write=text_to_write,
-                        double_click=double_click,
-                        action="none"
-                    )
-                # Give the UI time to react (animations, page loads).
-                # A function for acknowledging if the page has loaded would be good
-                # and probably will be done on an update.
-                time.sleep(1.0)
+                if not step_done:
+                    print(f"[VirtualBOT] Aborting: step '{step}' failed. Remaining steps skipped.")
+                    break
 
         # Error handling for showing in the logs that something is wrong.
         except json.JSONDecodeError as e:
@@ -458,3 +507,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    input("Press 'enter' for exiting.")
